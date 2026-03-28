@@ -1,0 +1,14 @@
+# Environments
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# App Output
+agent_output/
+thumbnails/
+
+# macOS
+.DS_Store
