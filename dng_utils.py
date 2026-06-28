@@ -3,7 +3,7 @@ import rawpy
 from PIL import Image
 from io import BytesIO
 
-def extract_thumbnail(dng_path, output_dir, max_size=(800, 800)):
+def extract_thumbnail(dng_path, output_dir, max_size=(640, 640)):
     """
     Extracts the embedded JPEG thumbnail from a DNG file and saves it.
     If the thumbnail is large, resizes it to a smaller dimension to save space
@@ -28,16 +28,24 @@ def extract_thumbnail(dng_path, output_dir, max_size=(800, 800)):
                 return None
             
             if thumb.format == rawpy.ThumbFormat.JPEG:
-                # Read the JPEG bytes into a PIL Image to resize it if needed
-                image = Image.open(BytesIO(thumb.data))
-                image.thumbnail(max_size, Image.Resampling.LANCZOS)
-                image.save(output_path, "JPEG", quality=85)
+                # Inspect dimensions without decoding the whole image to save CPU
+                with Image.open(BytesIO(thumb.data)) as image:
+                    width, height = image.size
+                    if width <= max_size[0] and height <= max_size[1]:
+                        # Save raw bytes directly (instant extraction)
+                        with open(output_path, "wb") as f:
+                            f.write(thumb.data)
+                        return output_path
+                    else:
+                        # Resize using BICUBIC (faster than LANCZOS)
+                        image.thumbnail(max_size, Image.Resampling.BICUBIC)
+                        image.save(output_path, "JPEG", quality=80)
                 return output_path
             elif thumb.format == rawpy.ThumbFormat.BITMAP:
                 # Less common for DNGs but possible
-                image = Image.fromarray(thumb.data)
-                image.thumbnail(max_size, Image.Resampling.LANCZOS)
-                image.save(output_path, "JPEG", quality=85)
+                with Image.fromarray(thumb.data) as image:
+                    image.thumbnail(max_size, Image.Resampling.BICUBIC)
+                    image.save(output_path, "JPEG", quality=80)
                 return output_path
     except Exception as e:
         print(f"Error extracting thumbnail from {dng_path}: {e}")

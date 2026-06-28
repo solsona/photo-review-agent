@@ -12,3 +12,7 @@ thumbnails/
 
 # macOS
 .DS_Store
+
+# Temporary outputs
+*.xmp
+curation_results.json

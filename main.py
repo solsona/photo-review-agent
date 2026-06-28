@@ -5,6 +5,7 @@ import datetime
 from tqdm import tqdm
 from dng_utils import extract_thumbnail, process_directory
 from agent import analyze_photo
+from xmp_utils import generate_xmp_sidecar
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -284,14 +285,22 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Limit number of photos to process (for testing)")
     parser.add_argument("--date", type=str, help="Enforce a specific date for this session (YYYY-MM-DD). If omitted, inferred from path.")
     parser.add_argument("--comment", type=str, default="", help="Optional comment/title (e.g., 'Street Walk with Leica Q3') to display in the index.")
+    parser.add_argument("--provider", default="gemini", choices=["gemini", "ollama"], help="AI provider (gemini or ollama)")
+    parser.add_argument("--model", help="AI model name (defaults: gemini-2.5-flash / gemma4:12b)")
+    parser.add_argument("--ollama-host", default="http://localhost:11434", help="Ollama Host URL")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip photos that already have an XMP sidecar review.")
     
     args = parser.parse_args()
+    
+    model_name = args.model
+    if not model_name:
+        model_name = "gemini-2.5-flash" if args.provider == "gemini" else "gemma4:12b"
     
     if not os.path.exists(args.source_dir):
         print(f"Error: Directory {args.source_dir} not found.")
         return
         
-    if not os.environ.get("GEMINI_API_KEY"):
+    if args.provider == "gemini" and not os.environ.get("GEMINI_API_KEY"):
         print("ERROR: GEMINI_API_KEY environment variable is missing.")
         print("Please run: export GEMINI_API_KEY='your-key-here'")
         return
@@ -313,7 +322,6 @@ def main():
         parts = normalized.split(os.sep)
         if len(parts) >= 2:
             try:
-                # E.g parts[-2] = "2026", parts[-1] = "03-01"
                 yr = int(parts[-2])
                 if len(parts[-1]) == 5 and parts[-1][2] == '-':
                     mo = int(parts[-1][0:2])
@@ -341,19 +349,52 @@ def main():
         
     print(f"Found {len(dng_files)} DNG files to process.")
     
+    if dng_files:
+        print("Pre-extracting photo thumbnails in parallel...")
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = min(8, os.cpu_count() or 4)
+        
+        def pre_extract(fname):
+            try:
+                dng_p = os.path.join(args.source_dir, fname)
+                extract_thumbnail(dng_p, cache_dir)
+            except Exception as e:
+                print(f"Error pre-extracting {fname}: {e}")
+                
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(tqdm(executor.map(pre_extract, dng_files), total=len(dng_files), desc="Caching Thumbnails"))
+            
     results = []
     
     for filename in tqdm(dng_files, desc="Processing Photos"):
         dng_path = os.path.join(args.source_dir, filename)
         
-        # 1. Extract JPEG
-        thumb_path = extract_thumbnail(dng_path, cache_dir)
-        
-        if not thumb_path:
-            continue
+        # Check for existing XMP review
+        analysis = None
+        xmp_path = os.path.splitext(dng_path)[0] + ".xmp"
+        if args.skip_existing and os.path.exists(xmp_path):
+            from xmp_utils import read_xmp_sidecar
+            analysis = read_xmp_sidecar(xmp_path)
             
-        # 2. Analyze with Gemini
-        analysis = analyze_photo(thumb_path)
+        if not analysis:
+            # 1. Extract JPEG
+            thumb_path = extract_thumbnail(dng_path, cache_dir)
+            
+            if not thumb_path:
+                continue
+                
+            # 2. Analyze with specified provider
+            analysis = analyze_photo(
+                thumb_path, 
+                model_name=model_name, 
+                provider=args.provider, 
+                ollama_host=args.ollama_host
+            )
+        else:
+            # Extract Thumbnail anyway so the index and HTML report work properly (fast extraction)
+            thumb_path = extract_thumbnail(dng_path, cache_dir)
+            if not thumb_path:
+                continue
         
         # 3. Store result
         result = {
@@ -366,7 +407,16 @@ def main():
         }
         results.append(result)
         
-        # Save intermediate JSON using a dictionary format to store root metadata
+        # 3.5 Write XMP Sidecar for Lightroom
+        generate_xmp_sidecar(
+            dng_path=dng_path,
+            score=analysis.get("score", 0),
+            is_promising=analysis.get("is_promising", False),
+            critique_bullets=analysis.get("critique_bullets", []),
+            style="Any",
+            photographers=[]
+        )
+        
         run_metadata = {
             "session_date": session_date,
             "comment": args.comment,
@@ -374,6 +424,11 @@ def main():
         }
         with open(os.path.join(run_dir, "metadata.json"), "w") as f:
             json.dump(run_metadata, f, indent=2)
+            
+        # Periodically collect garbage to free up RAM
+        if len(results) % 20 == 0:
+            import gc
+            gc.collect()
             
     # 4. Generate HTML for this specific run
     report_path = os.path.join(run_dir, "review_results.html")
